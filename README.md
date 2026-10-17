@@ -55,14 +55,23 @@
 
 ## 목소리
 
-게임은 `voice/` 폴더에 클립이 있으면 그걸 틀고, 없으면 브라우저 내장 TTS(Web Speech API)로 대체합니다.
+숫자 읽기는 **오디오 클립**(`voice/`)으로 재생합니다. 브라우저 내장 TTS는 iOS 제스처 제한, 한국어 음성 미설치, 리눅스·안드로이드 파이어폭스 미지원 등 환경마다 달라서, 파일로 틀어야 모든 브라우저에서 똑같이 들립니다. 클립이 없는 경우에만 TTS로 대체합니다.
 
 ```
-voice/n/1.mp3 … n/70.mp3         "하나!" "둘!" …
-voice/count/1.mp3 … count/70.mp3  "오늘은 고래를 한 마리 먹었어요. 잘 자요."
-voice/sleep.mp3                   "바다가 잠들었어요. 잘 자요."
+voice/n/1.m4a … n/70.m4a         "하나!" "둘!" …
+voice/count/1.m4a … count/70.m4a  "오늘은 고래를 한 마리 먹었어요. 잘 자요."
+voice/sleep.m4a                   "바다가 잠들었어요. 잘 자요."
 ```
 확장자는 mp3 / m4a / webm / wav 자동 감지. 일부만 있어도 되고(없는 건 TTS), 폴더가 없어도 됩니다.
+웹으로 열면 Web Audio로 디코딩해 재생(제스처 제약 없음), `file://`로 열면 `<audio>`로 재생합니다.
+
+지금 들어 있는 클립은 macOS 내장 음성(유나)으로 만든 것입니다 — 어른 목소리라 임시입니다. 더 좋은 목소리로 바꾸는 방법:
+
+**⓪ 맥 내장 음성으로 다시 만들기 (무료·즉시)**
+```
+tools/gen-voice-mac.sh Yuna 70
+```
+유나(프리미엄)를 설치해 두면 훨씬 자연스럽게 나옵니다. 기존 파일은 건너뛰니 다시 만들려면 `voice/`를 지우고 실행.
 
 **① 어린이 AI 목소리 — 네이버 CLOVA Voice (추천)**
 CLOVA Voice Premium에 아동 음성이 있습니다: `nhajun`(하준·남아) `ndain`(다인·여아) `ngaram`(가람·여아) `nmeow`(야옹이) `nwoof`(멍멍이).
@@ -89,10 +98,11 @@ macOS: 시스템 설정 → 손쉬운 사용 → 말하기 콘텐츠 → 음성 
 - 글꼴: Google Fonts **Jua** (없으면 시스템 글꼴)
 
 ```
-index.html         게임 전체
-tools/gen-voice.mjs  CLOVA 어린이 음성 클립 생성
-tools/record.html    직접 녹음 페이지
-voice/             (선택) 음성 클립
+index.html             게임 전체
+voice/                 음성 클립 (m4a, 141개)
+tools/gen-voice-mac.sh   맥 내장 음성으로 클립 생성
+tools/gen-voice.mjs      CLOVA 어린이 음성으로 클립 생성
+tools/record.html        직접 녹음 페이지
 ```
 
 ---

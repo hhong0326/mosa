@@ -202,13 +202,24 @@ function pickVoice() {
   koVoice = vs.find(v => /^ko/i.test(v.lang) && /Yuna|Sora|Google/i.test(v.name)) || vs.find(v => /^ko/i.test(v.lang)) || null;
 }
 if ('speechSynthesis' in window) { pickVoice(); speechSynthesis.addEventListener('voiceschanged', pickVoice); }
+let speakTimer = 0;
 function speak(txt, { rate = 0.85, pitch = 1.15 } = {}) {
   if (muted || !('speechSynthesis' in window)) return;
-  speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(txt);
-  u.lang = 'ko-KR'; if (koVoice) u.voice = koVoice;
-  u.rate = rate; u.pitch = pitch; u.volume = 1;
-  speechSynthesis.speak(u);
+  speechSynthesis.cancel(); clearTimeout(speakTimer);
+  // 크롬: cancel() 직후 speak()는 가끔 무시됨 → 한 틱 뒤에 호출
+  speakTimer = setTimeout(() => {
+    const u = new SpeechSynthesisUtterance(txt);
+    u.lang = 'ko-KR'; if (koVoice) u.voice = koVoice;
+    u.rate = rate; u.pitch = pitch; u.volume = 1;
+    speechSynthesis.speak(u);
+  }, 40);
+}
+// iOS 등은 첫 음성/오디오 재생이 사용자 제스처 안에서 시작돼야 함 → 첫 입력 때 한 번 풀어줌
+let voiceUnlocked = false;
+function unlockVoice() {
+  if (voiceUnlocked) return; voiceUnlocked = true;
+  if ('speechSynthesis' in window) { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); }
+  if (voiceExt && !useWebAudio) { const a = getClip('n/1'); a.muted = true; a.play().then(() => { a.pause(); a.currentTime = 0; a.muted = false; }).catch(() => {}); }
 }
 
 /* ---------------------------------------------------------------------
@@ -219,8 +230,10 @@ function speak(txt, { rate = 0.85, pitch = 1.15 } = {}) {
  * ------------------------------------------------------------------- */
 const VOICE_EXTS = ['mp3', 'm4a', 'webm', 'wav'];
 let voiceExt = null;            // null=탐색 전, ''=클립 없음
-let currentClip = null;
-const clipCache = new Map();
+let currentClip = null, currentSource = null;
+const clipCache = new Map();    // <audio> 요소 (file:// 로 열었을 때)
+const bufCache = new Map();     // 디코딩된 AudioBuffer (http/https — 제스처 제약 없이 재생 가능)
+const useWebAudio = location.protocol !== 'file:';   // file:// 에서는 fetch가 막혀 <audio>로
 
 function probeVoiceClips() {
   let i = 0;
@@ -228,26 +241,47 @@ function probeVoiceClips() {
     if (i >= VOICE_EXTS.length) { voiceExt = ''; return; }
     const ext = VOICE_EXTS[i++];
     const a = new Audio(`voice/n/1.${ext}`);
-    a.addEventListener('canplaythrough', () => { voiceExt = ext; for (let n = 1; n <= 12; n++) getClip(`n/${n}`); }, { once: true });
+    a.addEventListener('canplaythrough', () => { voiceExt = ext; preloadClips(); }, { once: true });
     a.addEventListener('error', tryNext, { once: true });
     a.load();
   };
   tryNext();
+}
+function preloadClips() {
+  if (!voiceExt) return;
+  for (let n = 1; n <= 12; n++) { if (useWebAudio && actx) loadBuffer(`n/${n}`).catch(() => {}); else if (!useWebAudio) getClip(`n/${n}`); }
 }
 function getClip(key) {
   let a = clipCache.get(key);
   if (!a) { a = new Audio(`voice/${key}.${voiceExt}`); a.preload = 'auto'; clipCache.set(key, a); }
   return a;
 }
+function loadBuffer(key) {
+  if (bufCache.has(key)) return bufCache.get(key);
+  const p = fetch(`voice/${key}.${voiceExt}`)
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
+    .then(b => actx.decodeAudioData(b));
+  bufCache.set(key, p); p.catch(() => bufCache.delete(key));
+  return p;
+}
 function stopVoice() {
   if (currentClip) { currentClip.pause(); currentClip = null; }
-  if ('speechSynthesis' in window) speechSynthesis.cancel();
+  if (currentSource) { try { currentSource.stop(); } catch (e) {} currentSource = null; }
+  if ('speechSynthesis' in window) { speechSynthesis.cancel(); clearTimeout(speakTimer); }
 }
 // 클립이 있으면 재생, 없거나 실패하면 TTS
 function say(key, fallbackText, ttsOpts) {
   if (muted) return;
   stopVoice();
   if (!voiceExt) { speak(fallbackText, ttsOpts); return; }
+  if (useWebAudio && actx) {
+    loadBuffer(key).then(buf => {
+      const s = actx.createBufferSource(); s.buffer = buf;
+      s.connect(actx.destination);   // 효과음 볼륨(master)과 별개로 또렷하게
+      s.start(); currentSource = s;
+    }).catch(() => speak(fallbackText, ttsOpts));
+    return;
+  }
   const a = getClip(key);
   currentClip = a; a.currentTime = 0;
   a.play().catch(() => { clipCache.delete(key); speak(fallbackText, ttsOpts); });
@@ -656,6 +690,8 @@ function emit(x, y, kind, n) {
 /* 입력 → 행동 */
 function action() {
   initAudio();
+  unlockVoice();
+  preloadClips();
   if (scene === 'start') { startGame(); return; }
   if (scene === 'end') { if (Date.now() >= sleepUntil && endT > 1.5) { scene = 'start'; sfx.pop(); } return; }
   if (mosa.state !== 'idle') return;
