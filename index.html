@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1d7fc0">
+<title>모사 — 바닷속 모사사우루스</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Jua&display=swap" rel="stylesheet">
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #0b4a86;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+/* =====================================================================
+ *  설정 (부모용)
+ *  - SESSION_SECONDS : 한 번에 놀 수 있는 시간 (초)
+ *  - COOLDOWN_SECONDS: 끝난 뒤 다시 놀 수 있을 때까지 기다리는 시간 (초)
+ *
+ *  테스트용 URL 파라미터 (예: index.html?session=20&cooldown=10)
+ *  - ?session=초   ?cooldown=초   ?reset (쿨다운 기록 삭제)
+ * ===================================================================== */
+const qs = new URLSearchParams(location.search);
+const num = (v, d) => (v !== null && !isNaN(+v) ? +v : d);
+const CONFIG = {
+  SESSION_SECONDS: num(qs.get('session'), 5 * 60),
+  COOLDOWN_SECONDS: num(qs.get('cooldown'), 30 * 60),
+  WHALE_GAP: [1.0, 2.6],      // 고래 사이 대기 시간 (초)
+  WHALE_SPEED: [28, 60],      // 고래 이동 속도 (px/s)
+};
+const STORAGE_KEY = 'mosa.sleepUntil';
+if (qs.has('reset')) localStorage.removeItem(STORAGE_KEY);
+
+/* ---------------------------------------------------------------------
+ *  캔버스 / 좌표계  (논리 해상도 960x540, 화면에 맞춰 축소·확대)
+ * ------------------------------------------------------------------- */
+const W = 960, H = 540;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let dpr = 1, scale = 1, ox = 0, oy = 0;
+let view = { x0: 0, y0: 0, x1: W, y1: H }; // 실제로 보이는 논리 영역(레터박스 포함)
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const vw = innerWidth, vh = innerHeight;
+  canvas.width = Math.round(vw * dpr);
+  canvas.height = Math.round(vh * dpr);
+  scale = Math.min(vw / W, vh / H);
+  ox = (vw - W * scale) / 2;
+  oy = (vh - H * scale) / 2;
+  view = { x0: -ox / scale, y0: -oy / scale, x1: W + ox / scale, y1: H + oy / scale };
+}
+addEventListener('resize', resize);
+resize();
+
+const FONT = "'Jua', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', sans-serif";
+const font = (px) => `${px}px ${FONT}`;
+
+/* ---------------------------------------------------------------------
+ *  유틸
+ * ------------------------------------------------------------------- */
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+const easeInOutCubic = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const easeInQuad = (t) => t * t;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+function hexToRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+function mixColor(a, b, t) {
+  const A = hexToRgb(a), B = hexToRgb(b);
+  return `rgb(${Math.round(lerp(A[0], B[0], t))},${Math.round(lerp(A[1], B[1], t))},${Math.round(lerp(A[2], B[2], t))})`;
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function text(str, x, y, size, color, align = 'center', stroke) {
+  ctx.font = font(size);
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  if (stroke) { ctx.lineWidth = size * 0.11; ctx.strokeStyle = stroke; ctx.lineJoin = 'round'; ctx.strokeText(str, x, y); }
+  ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+}
+
+/* ---------------------------------------------------------------------
+ *  사운드 (Web Audio 합성 — 외부 파일 없음)
+ * ------------------------------------------------------------------- */
+let actx = null, master = null, ambientGain = null, muted = false, noiseBuf = null;
+
+function initAudio() {
+  if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  actx = new AC();
+  master = actx.createGain();
+  master.gain.value = muted ? 0 : 0.7;
+  master.connect(actx.destination);
+  startAmbient();
+}
+function getNoise() {
+  if (noiseBuf) return noiseBuf;
+  const len = actx.sampleRate * 1.5;
+  noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  return noiseBuf;
+}
+function startAmbient() {
+  // 잔잔한 물소리: 저역 노이즈 + 아주 느린 파도 LFO
+  const src = actx.createBufferSource();
+  src.buffer = getNoise(); src.loop = true;
+  const lp = actx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 220; lp.Q.value = 0.5;
+  ambientGain = actx.createGain(); ambientGain.gain.value = 0.05;
+  const lfo = actx.createOscillator(); lfo.frequency.value = 0.08;
+  const lfoGain = actx.createGain(); lfoGain.gain.value = 0.025;
+  lfo.connect(lfoGain).connect(ambientGain.gain);
+  src.connect(lp).connect(ambientGain).connect(master);
+  src.start(); lfo.start();
+}
+function tone(freq, t0, dur, type = 'sine', vol = 0.3, slideTo) {
+  const o = actx.createOscillator(); o.type = type;
+  o.frequency.setValueAtTime(freq, t0);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol, t0 + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g).connect(master); o.start(t0); o.stop(t0 + dur + 0.05);
+}
+function noise(t0, dur, filterType, f0, f1, vol = 0.3) {
+  const n = actx.createBufferSource(); n.buffer = getNoise();
+  const f = actx.createBiquadFilter(); f.type = filterType; f.Q.value = 1;
+  f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
+  const g = actx.createGain();
+  g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  n.connect(f).connect(g).connect(master); n.start(t0); n.stop(t0 + dur + 0.02);
+}
+const sfx = {
+  chomp() { if (!actx) return; const t = actx.currentTime;
+    tone(170, t, 0.18, 'triangle', 0.7, 55);
+    noise(t, 0.14, 'lowpass', 2600, 250, 0.5);
+    noise(t + 0.09, 0.1, 'lowpass', 1800, 200, 0.35);
+  },
+  sparkle() { if (!actx) return; const t = actx.currentTime;
+    [523, 659, 784, 1047].forEach((f, i) => tone(f, t + 0.16 + i * 0.07, 0.22, 'sine', 0.18));
+  },
+  whoosh() { if (!actx) return; noise(actx.currentTime, 0.28, 'bandpass', 300, 1800, 0.25); },
+  pop() { if (!actx) return; tone(480, actx.currentTime, 0.1, 'sine', 0.25, 900); },
+  bubble() { if (!actx) return; tone(rand(600, 900), actx.currentTime, 0.07, 'sine', 0.12, rand(1100, 1500)); },
+  start() { if (!actx) return; const t = actx.currentTime;
+    [392, 523, 659].forEach((f, i) => tone(f, t + i * 0.09, 0.3, 'triangle', 0.22));
+  },
+  sleep() { if (!actx) return; const t = actx.currentTime;
+    [659, 523, 392, 330].forEach((f, i) => tone(f, t + i * 0.35, 0.8, 'sine', 0.2));
+  },
+};
+function setMuted(m) { muted = m; if (master) master.gain.value = m ? 0 : 0.7; if (m) stopVoice(); }
+
+/* ---------------------------------------------------------------------
+ *  한글 수 세기 + 음성 (Web Speech API — 브라우저 내장 한국어 음성 사용)
+ * ------------------------------------------------------------------- */
+const KO_ONES = ['', '하나', '둘', '셋', '넷', '다섯', '여섯', '일곱', '여덟', '아홉'];
+const KO_ONES_DET = ['', '한', '두', '세', '네', '다섯', '여섯', '일곱', '여덟', '아홉'];
+const KO_TENS = ['', '열', '스물', '서른', '마흔', '쉰', '예순', '일흔', '여든', '아흔'];
+// 셀 때: 하나, 둘, 셋 … 열하나 … 스물
+function koNumber(n) { if (n <= 0 || n > 99) return String(n); return KO_TENS[Math.floor(n / 10)] + KO_ONES[n % 10]; }
+// 단위 붙일 때: 한 마리, 두 마리, 세 마리, 네 마리, 스무 마리
+function koCount(n, unit) {
+  if (n <= 0 || n > 99) return `${n}${unit}`;
+  const t = Math.floor(n / 10), o = n % 10;
+  const word = (t === 2 && o === 0) ? '스무' : KO_TENS[t] + KO_ONES_DET[o];
+  return `${word} ${unit}`;
+}
+
+let koVoice = null;
+function pickVoice() {
+  const vs = speechSynthesis.getVoices();
+  koVoice = vs.find(v => /^ko/i.test(v.lang) && /Yuna|Sora|Google/i.test(v.name)) || vs.find(v => /^ko/i.test(v.lang)) || null;
+}
+if ('speechSynthesis' in window) { pickVoice(); speechSynthesis.addEventListener('voiceschanged', pickVoice); }
+function speak(txt, { rate = 0.85, pitch = 1.15 } = {}) {
+  if (muted || !('speechSynthesis' in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(txt);
+  u.lang = 'ko-KR'; if (koVoice) u.voice = koVoice;
+  u.rate = rate; u.pitch = pitch; u.volume = 1;
+  speechSynthesis.speak(u);
+}
+
+/* ---------------------------------------------------------------------
+ *  녹음/생성된 음성 클립 (voice/ 폴더). 있으면 클립, 없으면 위 TTS로 대체
+ *    voice/n/3.mp3      → "셋"
+ *    voice/count/3.mp3  → "오늘은 고래를 세 마리 먹었어요. 잘 자요."
+ *  확장자는 mp3 / m4a / webm / wav 중 처음 재생되는 것을 자동 선택
+ * ------------------------------------------------------------------- */
+const VOICE_EXTS = ['mp3', 'm4a', 'webm', 'wav'];
+let voiceExt = null;            // null=탐색 전, ''=클립 없음
+let currentClip = null;
+const clipCache = new Map();
+
+function probeVoiceClips() {
+  let i = 0;
+  const tryNext = () => {
+    if (i >= VOICE_EXTS.length) { voiceExt = ''; return; }
+    const ext = VOICE_EXTS[i++];
+    const a = new Audio(`voice/n/1.${ext}`);
+    a.addEventListener('canplaythrough', () => { voiceExt = ext; for (let n = 1; n <= 12; n++) getClip(`n/${n}`); }, { once: true });
+    a.addEventListener('error', tryNext, { once: true });
+    a.load();
+  };
+  tryNext();
+}
+function getClip(key) {
+  let a = clipCache.get(key);
+  if (!a) { a = new Audio(`voice/${key}.${voiceExt}`); a.preload = 'auto'; clipCache.set(key, a); }
+  return a;
+}
+function stopVoice() {
+  if (currentClip) { currentClip.pause(); currentClip = null; }
+  if ('speechSynthesis' in window) speechSynthesis.cancel();
+}
+// 클립이 있으면 재생, 없거나 실패하면 TTS
+function say(key, fallbackText, ttsOpts) {
+  if (muted) return;
+  stopVoice();
+  if (!voiceExt) { speak(fallbackText, ttsOpts); return; }
+  const a = getClip(key);
+  currentClip = a; a.currentTime = 0;
+  a.play().catch(() => { clipCache.delete(key); speak(fallbackText, ttsOpts); });
+}
+probeVoiceClips();
+
+/* ---------------------------------------------------------------------
+ *  고래 종류
+ * ------------------------------------------------------------------- */
+const WHALES = [
+  { id: 'blue',     name: '대왕고래', body: '#5f94cf', belly: '#d6e8f8', len: 210, h: 70, headR: 0.42, dorsal: 0.18, finLen: 0.2 },
+  { id: 'humpback', name: '혹등고래', body: '#4f6480', belly: '#e0e6ee', len: 180, h: 74, headR: 0.45, dorsal: 0.22, finLen: 0.38, bumps: true },
+  { id: 'orca',     name: '범고래',   body: '#232a36', belly: '#ffffff', len: 150, h: 66, headR: 0.5,  dorsal: 0.95, finLen: 0.24, eyePatch: true },
+  { id: 'beluga',   name: '벨루가',   body: '#f4f6f9', belly: '#ffffff', len: 125, h: 62, headR: 0.55, dorsal: 0,    finLen: 0.2, melon: true },
+  { id: 'narwhal',  name: '일각고래', body: '#a3afc0', belly: '#eaeef3', len: 130, h: 56, headR: 0.5,  dorsal: 0,    finLen: 0.2, tusk: true },
+  { id: 'sperm',    name: '향유고래', body: '#7a736e', belly: '#c9c1b8', len: 195, h: 82, headR: 0.3,  dorsal: 0.12, finLen: 0.18, boxHead: true },
+];
+
+/* 고래 그리기 — 머리가 +x 방향. dir=-1이면 왼쪽을 봄 */
+function drawWhale(w, x, y, t, dir = -1, size = 1, sleeping = false) {
+  const L = w.len * size, Hh = w.h * size;
+  const hx = L / 2, tx = -L / 2;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(dir, 1);
+
+  const body = () => {
+    ctx.beginPath();
+    ctx.moveTo(tx, -Hh * 0.08);
+    ctx.bezierCurveTo(tx + L * 0.22, -Hh * 0.6, hx - L * 0.45, -Hh * 0.58, hx - L * 0.12, -Hh * 0.46);
+    ctx.bezierCurveTo(hx + Hh * w.headR, -Hh * 0.48, hx + Hh * w.headR, Hh * 0.48, hx - L * 0.12, Hh * 0.46);
+    ctx.bezierCurveTo(hx - L * 0.45, Hh * 0.56, tx + L * 0.22, Hh * 0.48, tx, Hh * 0.08);
+    ctx.closePath();
+  };
+
+  // 꼬리 지느러미 (위아래로 살랑)
+  ctx.save();
+  ctx.translate(tx + 4 * size, 0);
+  ctx.rotate(Math.sin(t * 2.2) * 0.16);
+  ctx.fillStyle = w.body;
+  ctx.beginPath();
+  ctx.moveTo(6 * size, 0);
+  ctx.quadraticCurveTo(-Hh * 0.25, -Hh * 0.55, -Hh * 0.5, -Hh * 0.5);
+  ctx.quadraticCurveTo(-Hh * 0.22, -Hh * 0.12, -Hh * 0.16, 0);
+  ctx.quadraticCurveTo(-Hh * 0.22, Hh * 0.12, -Hh * 0.5, Hh * 0.5);
+  ctx.quadraticCurveTo(-Hh * 0.25, Hh * 0.55, 6 * size, 0);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  // 먼 쪽 가슴지느러미
+  ctx.save();
+  ctx.translate(hx - L * 0.32, Hh * 0.12);
+  ctx.rotate(0.35 + Math.sin(t * 2.5 + 1) * 0.1);
+  ctx.fillStyle = mixColor(w.body, '#000000', 0.18);
+  ctx.beginPath(); ctx.ellipse(-L * w.finLen * 0.5, 0, L * w.finLen * 0.5, Hh * 0.13, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  // 몸통
+  body(); ctx.fillStyle = w.body; ctx.fill();
+  // 배
+  ctx.save(); body(); ctx.clip();
+  ctx.fillStyle = w.belly;
+  ctx.beginPath(); ctx.ellipse(hx - L * 0.2, Hh * 0.42, L * 0.55, Hh * 0.36, 0, 0, Math.PI * 2); ctx.fill();
+  if (w.bumps) {
+    ctx.fillStyle = mixColor(w.body, '#ffffff', 0.25);
+    for (let i = 0; i < 5; i++) { ctx.beginPath(); ctx.arc(hx - L * 0.08 - i * L * 0.07, -Hh * 0.42 + i * 2, 2.2 * size, 0, Math.PI * 2); ctx.fill(); }
+  }
+  if (w.eyePatch) {
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.ellipse(hx - L * 0.2, -Hh * 0.2, L * 0.07, Hh * 0.1, -0.3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(tx + L * 0.4, -Hh * 0.08, L * 0.12, Hh * 0.16, 0.2, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+
+  // 등지느러미
+  if (w.dorsal > 0) {
+    const dx = -L * 0.02;
+    ctx.fillStyle = w.body;
+    ctx.beginPath();
+    ctx.moveTo(dx - L * 0.1, -Hh * 0.47);
+    ctx.quadraticCurveTo(dx - L * 0.02, -Hh * 0.5 - Hh * w.dorsal, dx + L * 0.03, -Hh * 0.5 - Hh * w.dorsal);
+    ctx.quadraticCurveTo(dx + L * 0.03, -Hh * 0.5, dx + L * 0.12, -Hh * 0.44);
+    ctx.closePath(); ctx.fill();
+  }
+  // 멜론 (벨루가 이마)
+  if (w.melon) {
+    ctx.fillStyle = w.body;
+    ctx.beginPath(); ctx.arc(hx - L * 0.14, -Hh * 0.36, Hh * 0.26, 0, Math.PI * 2); ctx.fill();
+  }
+  // 뿔 (일각고래)
+  if (w.tusk) {
+    ctx.strokeStyle = '#f3efe6'; ctx.lineCap = 'round';
+    ctx.lineWidth = 5 * size;
+    ctx.beginPath(); ctx.moveTo(hx + Hh * 0.3, Hh * 0.02); ctx.lineTo(hx + Hh * 0.3 + L * 0.5, -Hh * 0.08); ctx.stroke();
+    ctx.strokeStyle = '#d8d1c3'; ctx.lineWidth = 1.2 * size;
+    for (let i = 1; i < 6; i++) { const px = hx + Hh * 0.3 + i * L * 0.08, py = Hh * 0.02 - i * Hh * 0.016; ctx.beginPath(); ctx.moveTo(px, py - 2.5 * size); ctx.lineTo(px + 3 * size, py + 2.5 * size); ctx.stroke(); }
+  }
+  // 가까운 쪽 가슴지느러미
+  ctx.save();
+  ctx.translate(hx - L * 0.3, Hh * 0.22);
+  ctx.rotate(0.55 + Math.sin(t * 2.5) * 0.12);
+  ctx.fillStyle = mixColor(w.body, '#000000', 0.08);
+  ctx.beginPath(); ctx.ellipse(-L * w.finLen * 0.5, 0, L * w.finLen * 0.5, Hh * 0.14, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  // 눈
+  const ex = hx - L * 0.1, ey = -Hh * 0.16, er = Hh * 0.095;
+  if (sleeping) {
+    ctx.strokeStyle = '#1b2430'; ctx.lineWidth = 2.5 * size; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(ex, ey, er, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+  } else {
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex, ey, er, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#1b2430'; ctx.beginPath(); ctx.arc(ex + er * 0.2, ey, er * 0.58, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex + er * 0.35, ey - er * 0.3, er * 0.22, 0, Math.PI * 2); ctx.fill();
+  }
+  // 입 (미소)
+  ctx.strokeStyle = mixColor(w.body, '#000000', 0.45); ctx.lineWidth = 2 * size; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(hx + Hh * 0.12, Hh * 0.14); ctx.quadraticCurveTo(hx - L * 0.05, Hh * 0.28, hx - L * 0.2, Hh * 0.2); ctx.stroke();
+  // 볼 터치
+  ctx.fillStyle = 'rgba(255,140,150,0.45)';
+  ctx.beginPath(); ctx.ellipse(hx - L * 0.12, Hh * 0.05, Hh * 0.08, Hh * 0.05, 0, 0, Math.PI * 2); ctx.fill();
+
+  ctx.restore();
+}
+
+/* ---------------------------------------------------------------------
+ *  모사사우루스 그리기 — 머리가 +x 방향
+ * ------------------------------------------------------------------- */
+const MOSA = {
+  L: 180, H: 54,
+  hi: '#4fb3a0', top: '#2f8f82', mid: '#26786d', low: '#1d5f57',   // 등 → 배 쪽 명암
+  belly: '#f1e5c0', bellyShade: '#d8c79a',
+  gold: '#e8bb4c', outline: '#153b34', iris: '#f2c94c',
+  mouthIn: '#d9707f', tongue: '#ef9aa6',
+};
+
+// 3차 베지어 위의 점 (등 능선 배치용)
+function bez(p0, p1, p2, p3, t) {
+  const mt = 1 - t;
+  return {
+    x: mt * mt * mt * p0.x + 3 * mt * mt * t * p1.x + 3 * mt * t * t * p2.x + t * t * t * p3.x,
+    y: mt * mt * mt * p0.y + 3 * mt * mt * t * p1.y + 3 * mt * t * t * p2.y + t * t * t * p3.y,
+  };
+}
+
+function drawMosa(x, y, t, opts = {}) {
+  const { facing = 1, mouth = 0, sleeping = false, stretch = 1, tailAmp = 1 } = opts;
+  const { L, H: Hh, outline } = MOSA;
+  const hx = L / 2, tx = -L / 2;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(facing * stretch, 1 / Math.sqrt(stretch));
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+
+  const outlineStroke = (w = 3) => { ctx.strokeStyle = outline; ctx.lineWidth = w; ctx.stroke(); };
+  const vGrad = (y0, y1, c0, c1) => { const g = ctx.createLinearGradient(0, y0, 0, y1); g.addColorStop(0, c0); g.addColorStop(1, c1); return g; };
+
+  // 노 모양 지느러미: 그라데이션 + 외곽선 + 음영선
+  const paddle = (px, py, ang, len, far) => {
+    ctx.save(); ctx.translate(px, py); ctx.rotate(ang);
+    const rx = len * 0.5, ry = len * 0.32;
+    ctx.fillStyle = far ? MOSA.low : vGrad(-ry, ry, MOSA.top, MOSA.mid);
+    ctx.beginPath(); ctx.ellipse(rx, 0, rx, ry, 0, 0, Math.PI * 2); ctx.fill(); outlineStroke(2.5);
+    if (!far) {
+      ctx.strokeStyle = 'rgba(21,59,52,0.55)'; ctx.lineWidth = 1.5;
+      for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.moveTo(rx * 0.35, i * ry * 0.45); ctx.quadraticCurveTo(rx * 1.1, i * ry * 0.5, rx * 1.75, i * ry * 0.25); ctx.stroke(); }
+      ctx.fillStyle = 'rgba(255,255,255,0.18)';
+      ctx.beginPath(); ctx.ellipse(rx * 0.8, -ry * 0.4, rx * 0.5, ry * 0.25, 0, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  };
+  const sw = sleeping ? 0.15 : 1;
+  paddle(hx - 62, 4, 0.9 + Math.sin(t * 5 + 1) * 0.3 * sw, 30, true);
+  paddle(tx + 58, 2, 0.95 + Math.sin(t * 5 + 2) * 0.25 * sw, 22, true);
+
+  // 꼬리 지느러미
+  ctx.save();
+  ctx.translate(tx + 2, 0);
+  ctx.rotate(Math.sin(t * 6.5) * 0.2 * tailAmp * sw);
+  const fin = () => {
+    ctx.beginPath();
+    ctx.moveTo(8, -7);
+    ctx.quadraticCurveTo(-16, -32, -30, -42);
+    ctx.quadraticCurveTo(-13, -12, -12, 0);
+    ctx.quadraticCurveTo(-16, 16, -36, 46);
+    ctx.quadraticCurveTo(-14, 34, 8, 7);
+    ctx.closePath();
+  };
+  fin(); ctx.fillStyle = vGrad(-42, 46, MOSA.top, MOSA.low); ctx.fill(); outlineStroke();
+  ctx.save(); fin(); ctx.clip();
+  ctx.strokeStyle = MOSA.gold; ctx.lineWidth = 3.5;
+  ctx.beginPath(); ctx.moveTo(-6, -14); ctx.lineTo(-18, -28); ctx.moveTo(-6, 12); ctx.lineTo(-20, 30); ctx.stroke();
+  ctx.restore();
+  ctx.restore();
+
+  // 몸통 윤곽
+  const P0 = { x: tx, y: -5 }, P1 = { x: tx + 45, y: -Hh * 0.52 }, P2 = { x: hx - 75, y: -Hh * 0.64 }, P3 = { x: hx - 22, y: -Hh * 0.5 };
+  const body = () => {
+    ctx.beginPath();
+    ctx.moveTo(P0.x, P0.y);
+    ctx.bezierCurveTo(P1.x, P1.y, P2.x, P2.y, P3.x, P3.y);
+    ctx.bezierCurveTo(hx + 4, -Hh * 0.46, hx + 4, Hh * 0.3, hx - 22, Hh * 0.42);
+    ctx.bezierCurveTo(hx - 75, Hh * 0.58, tx + 45, Hh * 0.46, tx, 5);
+    ctx.closePath();
+  };
+
+  // 등 능선 (톱니) — 몸통보다 먼저 그려서 밑동이 가려짐
+  ctx.fillStyle = MOSA.mid;
+  for (let s = 0.08; s < 0.97; s += 0.055) {
+    const a = bez(P0, P1, P2, P3, s), b = bez(P0, P1, P2, P3, s + 0.03);
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y + 2); ctx.lineTo(mx + 1, my - 6); ctx.lineTo(b.x, b.y + 2); ctx.closePath();
+    ctx.fill(); outlineStroke(2);
+  }
+
+  // 몸통: 위→아래 명암
+  body(); ctx.fillStyle = vGrad(-Hh * 0.6, Hh * 0.55, MOSA.hi, MOSA.mid); ctx.fill();
+  ctx.save(); body(); ctx.clip();
+  // 아랫배 그림자
+  ctx.fillStyle = MOSA.low;
+  ctx.beginPath(); ctx.ellipse(hx - 60, Hh * 0.62, L * 0.55, Hh * 0.42, 0, 0, Math.PI * 2); ctx.fill();
+  // 크림색 배 + 경계선 + 주름
+  const bellyPath = () => { ctx.beginPath(); ctx.ellipse(hx - 58, Hh * 0.5, L * 0.44, Hh * 0.36, 0, 0, Math.PI * 2); };
+  bellyPath(); ctx.fillStyle = vGrad(Hh * 0.1, Hh * 0.9, MOSA.belly, MOSA.bellyShade); ctx.fill();
+  bellyPath(); ctx.strokeStyle = 'rgba(21,59,52,0.5)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.strokeStyle = 'rgba(21,59,52,0.28)'; ctx.lineWidth = 1.2;
+  for (let i = 0; i < 6; i++) { const px = hx - 110 + i * 18; ctx.beginPath(); ctx.moveTo(px, Hh * 0.2); ctx.quadraticCurveTo(px - 3, Hh * 0.42, px + 2, Hh * 0.62); ctx.stroke(); }
+  // 금색 줄무늬
+  ctx.strokeStyle = MOSA.gold; ctx.lineWidth = 4;
+  for (let i = 0; i < 8; i++) {
+    const px = hx - 38 - i * 21, py = -Hh * 0.3 + (i % 2) * 5, len = 9 + (i % 3) * 4;
+    ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px - len * 0.5, py + len * 0.9); ctx.stroke();
+  }
+  ctx.lineWidth = 3; ctx.globalAlpha = 0.8;
+  for (let i = 0; i < 5; i++) {
+    const px = hx - 52 - i * 30, py = Hh * 0.02 + (i % 2) * 3;
+    ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px - 5, py + 9); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  // 등 하이라이트
+  ctx.fillStyle = 'rgba(255,255,255,0.14)';
+  ctx.beginPath(); ctx.ellipse(hx - 70, -Hh * 0.36, L * 0.38, Hh * 0.12, 0.02, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+  body(); outlineStroke();
+
+  // 턱 (경첩 기준 회전)
+  const hingeX = hx - 26, hingeY = 7;
+  const open = mouth;
+  // 입속 + 혀
+  if (open > 0.04) {
+    ctx.save(); ctx.translate(hingeX, hingeY);
+    const ua = -open * 0.12, la = open * 0.8;
+    ctx.fillStyle = MOSA.mouthIn;
+    ctx.beginPath();
+    ctx.moveTo(0, -4);
+    ctx.lineTo(Math.cos(ua) * 70, -8 + Math.sin(ua) * 70);
+    ctx.lineTo(Math.cos(la) * 66, 2 + Math.sin(la) * 66);
+    ctx.closePath(); ctx.fill();
+    ctx.save(); ctx.rotate(la * 0.9); ctx.fillStyle = MOSA.tongue;
+    ctx.beginPath(); ctx.ellipse(28, -1, 20, 5.5, 0, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    ctx.restore();
+  }
+  // 위턱
+  ctx.save(); ctx.translate(hingeX, hingeY); ctx.rotate(-open * 0.12);
+  const upper = () => {
+    ctx.beginPath();
+    ctx.moveTo(-4, -Hh * 0.5 - 7);
+    ctx.quadraticCurveTo(30, -Hh * 0.52 - 9, 52, -24);   // 코 위 살짝 솟음
+    ctx.quadraticCurveTo(66, -22, 74, -11);
+    ctx.quadraticCurveTo(56, 0, 0, 1);
+    ctx.closePath();
+  };
+  upper(); ctx.fillStyle = vGrad(-Hh * 0.55, 2, MOSA.hi, MOSA.top); ctx.fill();
+  // 외곽선은 몸통 밖으로 나온 주둥이 부분만 (등쪽 선은 몸통 윤곽과 겹쳐 보이므로 생략)
+  ctx.beginPath();
+  ctx.moveTo(21, -33.7);
+  ctx.quadraticCurveTo(38.8, -31.7, 52, -24);
+  ctx.quadraticCurveTo(66, -22, 74, -11);
+  ctx.quadraticCurveTo(56, 0, 0, 1);
+  outlineStroke();
+  ctx.fillStyle = outline; ctx.beginPath(); ctx.ellipse(60, -18, 2.4, 1.6, 0.5, 0, Math.PI * 2); ctx.fill();   // 콧구멍
+  ctx.strokeStyle = 'rgba(21,59,52,0.4)'; ctx.lineWidth = 1.2;                                               // 입술선
+  ctx.beginPath(); ctx.moveTo(8, -3); ctx.quadraticCurveTo(40, -5, 66, -9); ctx.stroke();
+  if (open > 0.1) { // 둥근 이빨 (작게)
+    ctx.fillStyle = '#fffaf0';
+    for (let i = 0; i < 4; i++) { const px = 16 + i * 13; ctx.beginPath(); ctx.moveTo(px, -1.5); ctx.quadraticCurveTo(px + 4, 7, px + 8, -1.5); ctx.closePath(); ctx.fill(); }
+  }
+  ctx.restore();
+  // 아래턱
+  ctx.save(); ctx.translate(hingeX, hingeY); ctx.rotate(open * 0.8);
+  const lower = () => {
+    ctx.beginPath();
+    ctx.moveTo(0, -1);
+    ctx.quadraticCurveTo(46, -3, 70, 0);
+    ctx.quadraticCurveTo(50, 17, 0, 18);
+    ctx.closePath();
+  };
+  lower(); ctx.fillStyle = vGrad(-2, 18, MOSA.belly, MOSA.bellyShade); ctx.fill(); outlineStroke();
+  if (open > 0.1) {
+    ctx.fillStyle = '#fffaf0';
+    for (let i = 0; i < 3; i++) { const px = 22 + i * 14; ctx.beginPath(); ctx.moveTo(px, 0.5); ctx.quadraticCurveTo(px + 4, -6, px + 8, 0.5); ctx.closePath(); ctx.fill(); }
+  }
+  ctx.restore();
+
+  // 가까운 쪽 지느러미
+  paddle(hx - 56, 14, 0.75 + Math.sin(t * 5) * 0.35 * sw, 36, false);
+  paddle(tx + 64, 12, 0.85 + Math.sin(t * 5 + 1.5) * 0.3 * sw, 26, false);
+
+  // 눈: 크고 둥글게, 노란 홍채 (순한 인상)
+  const ex = hx - 34, ey = -Hh * 0.2;
+  if (sleeping) {
+    ctx.strokeStyle = outline; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(ex, ey, 9, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+  } else {
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex, ey, 11, 0, Math.PI * 2); ctx.fill(); outlineStroke(2.5);
+    ctx.fillStyle = MOSA.iris; ctx.beginPath(); ctx.arc(ex + 2, ey + 0.5, 7.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = outline; ctx.beginPath(); ctx.arc(ex + 2.5, ey + 1, 4.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex + 4.5, ey - 2.5, 2.6, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(ex - 0.5, ey + 3, 1.2, 0, Math.PI * 2); ctx.fill();
+    // 눈 위 살짝 덮는 눈꺼풀 → 부드러운 표정
+    ctx.save(); ctx.beginPath(); ctx.arc(ex, ey, 11, 0, Math.PI * 2); ctx.clip();
+    ctx.fillStyle = MOSA.top; ctx.beginPath(); ctx.arc(ex, ey - 17.5, 11.5, 0, Math.PI * 2); ctx.fill(); outlineStroke(2.5);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+/* ---------------------------------------------------------------------
+ *  게임 상태
+ * ------------------------------------------------------------------- */
+const HOME = { x: 230, y: 300 };
+let scene = 'start';         // 'start' | 'play' | 'end'
+let T = 0;                   // 전체 경과 시간 (애니메이션용)
+let sessionLeft = CONFIG.SESSION_SECONDS;
+let sleepUntil = +localStorage.getItem(STORAGE_KEY) || 0;
+let eaten = [];              // 먹은 고래 종류들
+let iconPop = 0;             // HUD 아이콘 통통 효과
+let endT = 0;                // 종료 화면 경과 시간
+
+const mosa = { x: HOME.x, y: HOME.y, state: 'idle', t: 0, dur: 0, from: { x: 0, y: 0 }, facing: 1, mouth: 0, nudge: 0 };
+let whale = null;
+let nextWhaleIn = 1.2;
+
+const particles = [];
+const popups = [];           // "셋!" 같은 숫자 말풍선
+const bgBubbles = [];
+const bgFish = [];
+const seaweed = [];
+const rocks = [];
+const rays = [];
+
+// 배경 스크롤 (모사가 앞으로 헤엄치는 느낌). 레이어마다 속도가 달라 원근감이 생김
+const SCROLL_SPEED = 48;     // px/s, 가장 가까운 레이어 기준
+const SCROLL_PERIOD = W + 800; // 배경 요소 반복 주기
+let scrollX = 0, scrollFactor = 1;
+const wrapX = (x, factor) => (((x - scrollX * factor) % SCROLL_PERIOD) + SCROLL_PERIOD) % SCROLL_PERIOD - 400;
+
+function initBackground() {
+  for (let i = 0; i < 26; i++) bgBubbles.push({ x: rand(view.x0, view.x1), y: rand(0, H), r: rand(1.5, 5), v: rand(12, 30), w: rand(0, 6.28) });
+  for (let i = 0; i < 7; i++) bgFish.push({ x: rand(view.x0, view.x1), y: rand(60, H - 120), v: rand(8, 20) * (Math.random() < 0.5 ? 1 : -1), s: rand(0.5, 1), w: rand(0, 6.28) });
+  for (let x = 0; x < SCROLL_PERIOD; x += rand(50, 90)) seaweed.push({ x, h: rand(50, 120), w: rand(0, 6.28), sp: rand(0.6, 1.2), col: pick(['#1f8f6a', '#2aa97c', '#187a60']) });
+  for (let x = 0; x < SCROLL_PERIOD; x += rand(220, 420)) rocks.push({ x, w: rand(90, 200), h: rand(40, 110), far: Math.random() < 0.5 });
+  for (let i = 0; i < 5; i++) rays.push({ x: rand(100, W - 100), w: rand(40, 110), ph: rand(0, 6.28) });
+}
+initBackground();
+
+function spawnWhale() {
+  const type = pick(WHALES);
+  const y = rand(90, H - 130);
+  whale = { type, x: W + type.len * 0.6 + 40, y, vx: -rand(CONFIG.WHALE_SPEED[0], CONFIG.WHALE_SPEED[1]), w: rand(0, 6.28), scale: 0 };
+}
+function startGame() {
+  scene = 'play';
+  sessionLeft = CONFIG.SESSION_SECONDS;
+  eaten = [];
+  whale = null; nextWhaleIn = 1.0;
+  Object.assign(mosa, { x: HOME.x, y: HOME.y, state: 'idle', mouth: 0, facing: 1 });
+  sfx.start();
+}
+function endSession() {
+  scene = 'end'; endT = 0;
+  sleepUntil = Date.now() + CONFIG.COOLDOWN_SECONDS * 1000;
+  localStorage.setItem(STORAGE_KEY, String(sleepUntil));
+  whale = null; particles.length = 0; popups.length = 0;
+  Object.assign(mosa, { x: W / 2, y: H / 2 + 20, state: 'idle', mouth: 0, facing: 1 });
+  sfx.sleep();
+  const n = eaten.length;
+  setTimeout(() => {
+    if (n) say(`count/${n}`, `오늘은 고래를 ${koCount(n, '마리')} 먹었어요. 잘 자요.`, { rate: 0.8 });
+    else say('sleep', '바다가 잠들었어요. 잘 자요.', { rate: 0.8 });
+  }, 1600);
+}
+
+function emit(x, y, kind, n) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), sp = rand(40, 180);
+    particles.push({
+      x, y, kind, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 30,
+      life: rand(0.5, 1.1), age: 0, r: rand(3, 8), rot: rand(0, 6.28),
+      col: pick(['#ffd54f', '#ff8a80', '#80d8ff', '#ccff90', '#ffffff']),
+    });
+  }
+}
+
+/* 입력 → 행동 */
+function action() {
+  initAudio();
+  if (scene === 'start') { startGame(); return; }
+  if (scene === 'end') { if (Date.now() >= sleepUntil && endT > 1.5) { scene = 'start'; sfx.pop(); } return; }
+  if (mosa.state !== 'idle') return;
+  if (whale && !whale.caught && whale.x < W - 60) {
+    mosa.state = 'dash'; mosa.t = 0;
+    mosa.from = { x: mosa.x, y: mosa.y };
+    const d = Math.hypot(whale.x - 65 - mosa.x, whale.y - mosa.y);
+    mosa.dur = clamp(d / 1100, 0.22, 0.55);
+    sfx.whoosh();
+  } else {
+    // 고래가 없을 때: 살짝 꿈틀 + 거품
+    mosa.nudge = 1; sfx.bubble();
+    emit(mosa.x + 80 * mosa.facing, mosa.y - 20, 'bubble', 3);
+  }
+}
+
+/* ---------------------------------------------------------------------
+ *  업데이트
+ * ------------------------------------------------------------------- */
+function update(dt) {
+  T += dt;
+  mosa.nudge = Math.max(0, mosa.nudge - dt * 3);
+  iconPop = Math.max(0, iconPop - dt * 3);
+
+  // 배경 스크롤 (잠든 바다에서는 서서히 멈춤)
+  scrollFactor = lerp(scrollFactor, scene === 'end' ? 0 : 1, dt * 1.5);
+  scrollX += SCROLL_SPEED * scrollFactor * dt;
+  const drift = SCROLL_SPEED * scrollFactor * dt;
+  for (const b of bgBubbles) { b.y -= b.v * dt; b.x += Math.sin(T * 1.5 + b.w) * 8 * dt - drift * 0.5; if (b.y < -10) { b.y = H + 10; b.x = rand(view.x0, view.x1); } if (b.x < view.x0 - 10) b.x = view.x1 + 10; }
+  for (const f of bgFish) { f.x += f.v * dt - drift * 0.35; if (f.x < view.x0 - 60) f.x = view.x1 + 60; if (f.x > view.x1 + 60) f.x = view.x0 - 60; }
+  for (let i = popups.length - 1; i >= 0; i--) { popups[i].age += dt; if (popups[i].age > 1.4) popups.splice(i, 1); }
+
+  // 파티클
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i]; p.age += dt;
+    if (p.kind === 'bubble') { p.vy -= 120 * dt; p.vx *= 0.96; }
+    else { p.vy += 140 * dt; p.vx *= 0.98; p.rot += dt * 4; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.age >= p.life) particles.splice(i, 1);
+  }
+
+  // 고래 스폰/이동 (시작 화면에서도 장식용으로 돌아다님)
+  if (scene !== 'end') {
+    if (whale) {
+      if (!whale.caught) {
+        whale.x += whale.vx * dt;
+        whale.y += Math.sin(T * 1.3 + whale.w) * 10 * dt;
+      }
+      whale.scale = Math.min(1, whale.scale + dt * 3);
+      if (whale.x < -whale.type.len) { whale = null; nextWhaleIn = rand(CONFIG.WHALE_GAP[0], CONFIG.WHALE_GAP[1]); }
+    } else {
+      nextWhaleIn -= dt;
+      if (nextWhaleIn <= 0) spawnWhale();
+    }
+  }
+
+  if (scene === 'play') {
+    sessionLeft -= dt;
+    if (sessionLeft <= 0 && mosa.state === 'idle') { endSession(); return; }
+  }
+  if (scene === 'end') endT += dt;
+
+  // 모사 상태 머신
+  const m = mosa;
+  if (m.state === 'idle') {
+    m.mouth = lerp(m.mouth, 0, dt * 10);
+    const home = scene === 'end' ? { x: W / 2, y: H / 2 + 20 } : HOME;
+    m.x = lerp(m.x, home.x, dt * 6);
+    m.y = lerp(m.y, home.y + Math.sin(T * 1.8) * 8, dt * 6);
+    m.facing = 1;
+  } else if (m.state === 'dash') {
+    m.t += dt;
+    const k = easeInQuad(clamp(m.t / m.dur, 0, 1));
+    // 입(머리 앞쪽)이 고래 몸통에 닿도록 몸 중심은 고래보다 왼쪽에 멈춤
+    const tgt = whale ? { x: whale.x - 65, y: whale.y + 4 } : HOME;
+    m.x = lerp(m.from.x, tgt.x, k);
+    m.y = lerp(m.from.y, tgt.y, k);
+    m.facing = tgt.x >= m.from.x ? 1 : -1;
+    m.mouth = lerp(m.mouth, 1, dt * 8);
+    if (Math.random() < 0.6) emit(m.x - 70 * m.facing, m.y + rand(-15, 15), 'bubble', 1);
+    if (m.t >= m.dur) {
+      m.state = 'chomp'; m.t = 0;
+      if (whale) whale.caught = true; // 고래는 멈추고, 입이 닫힐 때 사라짐
+    }
+  } else if (m.state === 'chomp') {
+    m.t += dt;
+    m.mouth = m.t < 0.1 ? 1 : lerp(m.mouth, 0, dt * 16);
+    if (m.t >= 0.1 && whale && whale.caught) {
+      eaten.push(whale.type); iconPop = 1;
+      emit(whale.x, whale.y, 'star', 14);
+      emit(whale.x, whale.y, 'bubble', 10);
+      const n = eaten.length;
+      popups.push({ x: clamp(whale.x, 120, W - 120), y: Math.max(130, whale.y - 110), n, age: 0 });
+      whale = null; nextWhaleIn = rand(CONFIG.WHALE_GAP[0], CONFIG.WHALE_GAP[1]);
+      sfx.chomp();
+      say(`n/${n}`, koNumber(n));   // "하나", "둘", "셋" …
+    }
+    if (m.t >= 0.4) { m.state = 'return'; m.t = 0; m.from = { x: m.x, y: m.y }; m.dur = 0.7; }
+  } else if (m.state === 'return') {
+    m.t += dt;
+    const k = easeInOutCubic(clamp(m.t / m.dur, 0, 1));
+    m.x = lerp(m.from.x, HOME.x, k);
+    m.y = lerp(m.from.y, HOME.y, k);
+    m.facing = HOME.x >= m.from.x - 1 ? 1 : -1;
+    m.mouth = lerp(m.mouth, 0, dt * 10);
+    if (m.t >= m.dur) { m.state = 'idle'; m.facing = 1; }
+  }
+}
+
+/* ---------------------------------------------------------------------
+ *  그리기
+ * ------------------------------------------------------------------- */
+function nightAmount() {
+  if (scene === 'end') return 1;
+  if (scene === 'play') return smoothstep(0.75, 1, 1 - sessionLeft / CONFIG.SESSION_SECONDS) * 0.85;
+  return 0;
+}
+
+function drawBackground(night) {
+  const g = ctx.createLinearGradient(0, view.y0, 0, view.y1);
+  g.addColorStop(0, mixColor('#4cc3ef', '#0d1f44', night));
+  g.addColorStop(0.5, mixColor('#1f86c7', '#07173a', night));
+  g.addColorStop(1, mixColor('#0b4a86', '#030c22', night));
+  ctx.fillStyle = g;
+  ctx.fillRect(view.x0, view.y0, view.x1 - view.x0, view.y1 - view.y0);
+
+  // 빛줄기
+  if (night < 0.9) {
+    ctx.save(); ctx.globalAlpha = 0.09 * (1 - night);
+    ctx.fillStyle = '#ffffff';
+    for (const r of rays) {
+      const sway = Math.sin(T * 0.3 + r.ph) * 40;
+      const rx = wrapX(r.x + 400, 0.12);
+      ctx.beginPath();
+      ctx.moveTo(rx - r.w * 0.3, view.y0);
+      ctx.lineTo(rx + r.w * 0.3, view.y0);
+      ctx.lineTo(rx + r.w + sway, view.y1);
+      ctx.lineTo(rx - r.w + sway, view.y1);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+  }
+  // 밤: 별과 달 (물 위에서 비치는 느낌)
+  if (night > 0.3) {
+    ctx.save(); ctx.globalAlpha = (night - 0.3) / 0.7;
+    ctx.fillStyle = '#fff7d6';
+    for (let i = 0; i < 18; i++) { const sx = (i * 173.3) % (W + 200) - 100, sy = 20 + (i * 97.7) % 120; const tw = 0.6 + 0.4 * Math.sin(T * 2 + i); ctx.globalAlpha *= 1; ctx.beginPath(); ctx.arc(sx, sy, 1.5 * tw, 0, Math.PI * 2); ctx.fill(); }
+    ctx.fillStyle = '#fff3c4';
+    ctx.beginPath(); ctx.arc(W - 120, 70, 30, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = mixColor('#4cc3ef', '#0d1f44', 1);
+    ctx.beginPath(); ctx.arc(W - 108, 62, 26, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  // 먼 물고기
+  ctx.save(); ctx.globalAlpha = 0.35;
+  for (const f of bgFish) {
+    ctx.save(); ctx.translate(f.x, f.y + Math.sin(T * 2 + f.w) * 4); ctx.scale(f.v > 0 ? 1 : -1, 1);
+    ctx.fillStyle = mixColor('#9fe3ff', '#223a66', night);
+    ctx.beginPath(); ctx.ellipse(0, 0, 14 * f.s, 7 * f.s, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-12 * f.s, 0); ctx.lineTo(-22 * f.s, -7 * f.s); ctx.lineTo(-22 * f.s, 7 * f.s); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+
+  // 먼 바위 (느리게) / 가까운 바위 (중간 속도)
+  for (const pass of [true, false]) {
+    ctx.fillStyle = pass ? mixColor('#1a6aa8', '#0a1a3a', night) : mixColor('#2b5f8f', '#0e1b38', night);
+    for (const r of rocks) {
+      if (r.far !== pass) continue;
+      const rx = wrapX(r.x, pass ? 0.3 : 0.6);
+      const rh = r.h * (pass ? 1.4 : 1), rw = r.w * (pass ? 1.3 : 1);
+      ctx.beginPath(); ctx.moveTo(rx - rw / 2, H - 30);
+      ctx.quadraticCurveTo(rx - rw * 0.3, H - 30 - rh, rx + rw * 0.05, H - 30 - rh * 0.9);
+      ctx.quadraticCurveTo(rx + rw * 0.4, H - 30 - rh * 0.8, rx + rw / 2, H - 30);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+
+  // 모래
+  ctx.fillStyle = mixColor('#e7c98b', '#2b2a3a', night);
+  ctx.beginPath();
+  ctx.moveTo(view.x0, view.y1);
+  for (let x = view.x0; x <= view.x1 + 40; x += 40) ctx.lineTo(x, H - 38 + Math.sin((x + scrollX) * 0.02) * 6);
+  ctx.lineTo(view.x1, view.y1); ctx.closePath(); ctx.fill();
+
+  // 해초 (가장 가까운 레이어)
+  ctx.lineCap = 'round';
+  for (const s of seaweed) {
+    const sx = wrapX(s.x, 1);
+    if (sx < view.x0 - 40 || sx > view.x1 + 40) continue;
+    ctx.strokeStyle = mixColor(s.col, '#0f2a2a', night * 0.8);
+    ctx.lineWidth = 7;
+    ctx.beginPath(); ctx.moveTo(sx, H - 30);
+    const sway = Math.sin(T * s.sp + s.w) * 18;
+    ctx.quadraticCurveTo(sx + sway * 0.5, H - 30 - s.h * 0.5, sx + sway, H - 30 - s.h);
+    ctx.stroke();
+  }
+  // 조개/돌
+  ctx.fillStyle = mixColor('#d4a86a', '#222233', night);
+  for (let x = 0; x < SCROLL_PERIOD; x += 170) { const sx = wrapX(x + 60, 1); ctx.beginPath(); ctx.ellipse(sx, H - 30, 22, 9, 0, 0, Math.PI * 2); ctx.fill(); }
+
+  // 배경 거품
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  for (const b of bgBubbles) { ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill(); }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const a = 1 - p.age / p.life;
+    ctx.save(); ctx.globalAlpha = a; ctx.translate(p.x, p.y);
+    if (p.kind === 'bubble') {
+      ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(0, 0, p.r * 0.6, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fill();
+    } else {
+      ctx.rotate(p.rot); ctx.fillStyle = p.col;
+      ctx.beginPath();
+      for (let i = 0; i < 10; i++) { const r = i % 2 ? p.r * 0.45 : p.r; const an = (i / 10) * Math.PI * 2; ctx.lineTo(Math.cos(an) * r, Math.sin(an) * r); }
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+/* HUD 버튼 영역 (논리 좌표) */
+const BTN = { mute: { x: W - 56, y: 14, w: 42, h: 42 }, full: { x: W - 106, y: 14, w: 42, h: 42 } };
+
+function drawHudButtons(night) {
+  const col = 'rgba(255,255,255,0.75)';
+  for (const [key, b] of Object.entries(BTN)) {
+    ctx.fillStyle = 'rgba(0,0,0,0.18)'; roundRect(b.x, b.y, b.w, b.h, 10); ctx.fill();
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2.5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    if (key === 'mute') {
+      ctx.beginPath(); ctx.moveTo(cx - 10, cy - 5); ctx.lineTo(cx - 5, cy - 5); ctx.lineTo(cx + 2, cy - 11); ctx.lineTo(cx + 2, cy + 11); ctx.lineTo(cx - 5, cy + 5); ctx.lineTo(cx - 10, cy + 5); ctx.closePath(); ctx.fill();
+      if (muted) { ctx.beginPath(); ctx.moveTo(cx + 6, cy - 6); ctx.lineTo(cx + 14, cy + 6); ctx.moveTo(cx + 14, cy - 6); ctx.lineTo(cx + 6, cy + 6); ctx.stroke(); }
+      else { ctx.beginPath(); ctx.arc(cx + 3, cy, 8, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 3, cy, 13, -0.9, 0.9); ctx.stroke(); }
+    } else {
+      const s = 7;
+      ctx.beginPath();
+      ctx.moveTo(cx - 11, cy - 11 + s); ctx.lineTo(cx - 11, cy - 11); ctx.lineTo(cx - 11 + s, cy - 11);
+      ctx.moveTo(cx + 11 - s, cy - 11); ctx.lineTo(cx + 11, cy - 11); ctx.lineTo(cx + 11, cy - 11 + s);
+      ctx.moveTo(cx + 11, cy + 11 - s); ctx.lineTo(cx + 11, cy + 11); ctx.lineTo(cx + 11 - s, cy + 11);
+      ctx.moveTo(cx - 11 + s, cy + 11); ctx.lineTo(cx - 11, cy + 11); ctx.lineTo(cx - 11, cy + 11 - s);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawEatenRow(x, y, maxW, size = 0.17) {
+  // 먹은 고래 아이콘 (왼쪽부터 차례로, 줄 넘김)
+  let cx = x, cy = y, row = 0;
+  const gap = 44;
+  for (let i = 0; i < eaten.length; i++) {
+    const w = eaten[i];
+    const last = i === eaten.length - 1;
+    const pop = last ? 1 + Math.sin(iconPop * Math.PI) * 0.5 : 1;
+    drawWhale(w, cx, cy, T + i, 1, size * pop);
+    cx += gap;
+    if (cx > x + maxW) { cx = x; row++; cy = y + row * 34; }
+  }
+}
+
+function drawTimeBar() {
+  // 상단 가운데: 세션 남은 시간 (해 → 달)
+  const p = 1 - sessionLeft / CONFIG.SESSION_SECONDS;
+  const bx = W / 2 - 110, by = 22, bw = 220, bh = 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.2)'; roundRect(bx, by, bw, bh, 5); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.75)'; roundRect(bx, by, bw * (1 - p), bh, 5); ctx.fill();
+  // 해
+  const sx = bx + bw * (1 - p);
+  ctx.fillStyle = p < 0.75 ? '#ffd54f' : '#fff3c4';
+  ctx.beginPath(); ctx.arc(sx, by + bh / 2, 11, 0, Math.PI * 2); ctx.fill();
+  if (p >= 0.75) { ctx.fillStyle = mixColor('#4cc3ef', '#0d1f44', nightAmount()); ctx.beginPath(); ctx.arc(sx + 5, by + bh / 2 - 3, 9, 0, Math.PI * 2); ctx.fill(); }
+}
+
+function draw() {
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+  const night = nightAmount();
+  drawBackground(night);
+
+  if (whale) {
+    const s = easeOutCubic(whale.scale);
+    drawWhale(whale.type, whale.x, whale.y + Math.sin(T * 1.3 + whale.w) * 6, T + whale.w, -1, s);
+  }
+
+  if (scene === 'end') {
+    drawMosa(mosa.x, mosa.y, T, { sleeping: true, tailAmp: 0.2 });
+    // Zzz
+    for (let i = 0; i < 3; i++) {
+      const ph = (T * 0.6 + i * 0.33) % 1;
+      ctx.save(); ctx.globalAlpha = (1 - ph) * 0.9;
+      text('z', mosa.x + 80 + ph * 30 + i * 6, mosa.y - 50 - ph * 60, 22 + i * 6, '#ffffff');
+      ctx.restore();
+    }
+  } else {
+    const nud = Math.sin(mosa.nudge * Math.PI) * 0.08;
+    const stretch = mosa.state === 'dash' ? 1.12 : 1 + nud;
+    drawMosa(mosa.x, mosa.y, T, { facing: mosa.facing, mouth: mosa.mouth, stretch, tailAmp: mosa.state === 'dash' ? 2 : 1 });
+  }
+
+  drawParticles();
+
+  // 숫자 말풍선: 커졌다가 살짝 떠오르며 사라짐
+  for (const p of popups) {
+    const grow = p.age < 0.25 ? easeOutCubic(p.age / 0.25) * 1.25 : lerp(1.25, 1, smoothstep(0.25, 0.45, p.age));
+    const fade = 1 - smoothstep(1.0, 1.4, p.age);
+    ctx.save(); ctx.globalAlpha = fade;
+    ctx.translate(p.x, p.y - p.age * 30); ctx.scale(grow, grow);
+    text(String(p.n), 0, -18, 76, '#ffffff', 'center', '#1b3a5c');
+    text(koNumber(p.n), 0, 44, 46, '#ffd54f', 'center', '#5a3200');
+    ctx.restore();
+  }
+
+  // 장면별 UI
+  if (scene === 'start') {
+    ctx.save(); ctx.globalAlpha = 0.9;
+    text('모사', W / 2, 120, 96, '#ffffff', 'center', 'rgba(7,40,80,0.6)');
+    text('바닷속 모사사우루스', W / 2, 185, 30, '#dff3ff', 'center', 'rgba(7,40,80,0.5)');
+    ctx.restore();
+    const bob = Math.sin(T * 3) * 4;
+    ctx.fillStyle = '#ffb703'; roundRect(W / 2 - 120, 370 + bob, 240, 76, 38); ctx.fill();
+    ctx.fillStyle = '#ffd166'; roundRect(W / 2 - 112, 376 + bob, 224, 60, 30); ctx.fill();
+    text('시작!', W / 2, 408 + bob, 40, '#5a3200');
+    text('스페이스바 또는 화면을 눌러 고래를 냠!', W / 2, 470, 20, 'rgba(255,255,255,0.85)', 'center', 'rgba(7,40,80,0.4)');
+  } else if (scene === 'play') {
+    // 왼쪽 위: 숫자 배지 + 한글 + 먹은 고래 아이콘
+    const n = eaten.length;
+    const pop = 1 + Math.sin(iconPop * Math.PI) * 0.18;
+    ctx.save(); ctx.translate(50, 44); ctx.scale(pop, pop);
+    ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.beginPath(); ctx.arc(0, 0, 30, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ffd166'; ctx.beginPath(); ctx.arc(0, 0, 26, 0, Math.PI * 2); ctx.fill();
+    text(String(n), 0, 1, 32, '#5a3200');
+    ctx.restore();
+    if (n > 0) {
+      ctx.font = font(24); const tw = ctx.measureText(koNumber(n)).width + 22;
+      ctx.fillStyle = 'rgba(7,40,80,0.45)'; roundRect(50 - tw / 2, 78, tw, 32, 16); ctx.fill();
+      text(koNumber(n), 50, 94, 24, '#ffffff');
+    }
+    drawEatenRow(104, 32, W - 420);
+    drawTimeBar();
+  } else if (scene === 'end') {
+    const remain = Math.max(0, sleepUntil - Date.now());
+    const fade = clamp(endT / 1.2, 0, 1);
+    ctx.save(); ctx.globalAlpha = fade;
+    text('바다가 잠들었어요', W / 2, 100, 56, '#fff6d8', 'center', 'rgba(5,15,40,0.6)');
+    text('모사도 코~ 자요. 내일 또 만나요!', W / 2, 155, 26, '#cfe1ff');
+    if (eaten.length) {
+      text(`오늘은 고래를 ${koCount(eaten.length, '마리')} 먹었어요 (${eaten.length})`, W / 2, 420, 22, '#ffd54f', 'center', 'rgba(5,15,40,0.5)');
+      const perRow = Math.min(eaten.length, 18);
+      drawEatenRow(W / 2 - (perRow - 1) * 22, 455, perRow * 44 + 1, 0.15);
+    }
+    if (remain > 0) {
+      const mm = Math.floor(remain / 60000), ss = Math.floor((remain % 60000) / 1000);
+      text(`${mm}분 ${String(ss).padStart(2, '0')}초 후에 다시 놀 수 있어요`, W / 2, 515, 18, 'rgba(255,255,255,0.55)');
+    } else if (endT > 1.5) {
+      const bob = Math.sin(T * 3) * 3;
+      ctx.fillStyle = '#ffb703'; roundRect(W / 2 - 100, 495 + bob, 200, 36, 18); ctx.fill();
+      text('다시 놀기', W / 2, 513 + bob, 22, '#5a3200');
+    }
+    ctx.restore();
+  }
+
+  drawHudButtons(night);
+}
+
+/* ---------------------------------------------------------------------
+ *  입력
+ * ------------------------------------------------------------------- */
+addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'Enter' || e.code === 'ArrowUp') e.preventDefault();
+  if (e.key === 'Escape' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === 'm' || e.key === 'M') { setMuted(!muted); return; }
+  action();
+});
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const lx = (e.clientX - ox) / scale, ly = (e.clientY - oy) / scale;
+  for (const [key, b] of Object.entries(BTN)) {
+    if (lx >= b.x && lx <= b.x + b.w && ly >= b.y && ly <= b.y + b.h) {
+      if (key === 'mute') { initAudio(); setMuted(!muted); }
+      else {
+        if (document.fullscreenElement) document.exitFullscreen?.();
+        else (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen)?.call(document.documentElement);
+      }
+      return;
+    }
+  }
+  action();
+});
+addEventListener('contextmenu', (e) => e.preventDefault());
+
+// 쿨다운 중이면 바로 잠든 바다 화면으로
+if (sleepUntil > Date.now()) {
+  scene = 'end'; endT = 2;
+  Object.assign(mosa, { x: W / 2, y: H / 2 + 20 });
+}
+
+/* ---------------------------------------------------------------------
+ *  루프
+ * ------------------------------------------------------------------- */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  if (!document.hidden) update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+if (document.fonts && document.fonts.load) document.fonts.load("20px 'Jua'").catch(() => {});
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

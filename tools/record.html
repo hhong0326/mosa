@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>모사 목소리 녹음</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  body { font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; background: #0b4a86; color: #fff; margin: 0; padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 18px; }
+  h1 { font-size: 22px; margin: 0; }
+  .hint { font-size: 14px; opacity: .8; text-align: center; max-width: 520px; line-height: 1.5; }
+  .card { background: rgba(255,255,255,.1); border-radius: 20px; padding: 28px; width: min(520px, 100%); box-sizing: border-box; text-align: center; }
+  .step { font-size: 14px; opacity: .7; }
+  .phrase { font-size: 48px; margin: 12px 0 4px; font-weight: 700; }
+  .sub { font-size: 16px; opacity: .8; min-height: 22px; }
+  .row { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 18px; }
+  button { font: inherit; font-size: 16px; border: 0; border-radius: 999px; padding: 12px 20px; cursor: pointer; background: #ffd166; color: #5a3200; font-weight: 700; }
+  button.ghost { background: rgba(255,255,255,.18); color: #fff; }
+  button.rec { background: #ff6b6b; color: #fff; }
+  button.rec.on { animation: blink 1s infinite; }
+  button:disabled { opacity: .4; cursor: default; }
+  @keyframes blink { 50% { opacity: .5; } }
+  .list { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 6px; width: min(520px, 100%); }
+  .list button { padding: 8px 4px; font-size: 13px; border-radius: 10px; background: rgba(255,255,255,.15); color: #fff; }
+  .list button.done { background: #2aa97c; }
+  .list button.cur { outline: 3px solid #ffd166; }
+</style>
+</head>
+<body>
+<h1>🎙️ 모사 목소리 녹음</h1>
+<p class="hint">엄마·아빠, 또는 아이 자신의 목소리로 숫자를 녹음해요. 각 문구마다 <b>녹음 → 말하기 → 정지</b>. 다 되면 ZIP을 받아 압축을 풀고 <code>voice/</code> 폴더를 게임 폴더(<code>index.html</code> 옆)에 넣으면 끝.</p>
+
+<div class="card">
+  <div class="step" id="step"></div>
+  <div class="phrase" id="phrase"></div>
+  <div class="sub" id="sub"></div>
+  <div class="row">
+    <button class="ghost" id="prev">◀ 이전</button>
+    <button class="rec" id="rec">● 녹음</button>
+    <button class="ghost" id="play" disabled>▶ 들어보기</button>
+    <button class="ghost" id="next">다음 ▶</button>
+  </div>
+</div>
+
+<div class="list" id="list"></div>
+<div class="row">
+  <button id="zip" disabled>💾 ZIP 다운로드 (<span id="count">0</span>개)</button>
+</div>
+
+<script>
+'use strict';
+const ONES = ['', '하나', '둘', '셋', '넷', '다섯', '여섯', '일곱', '여덟', '아홉'];
+const ONES_DET = ['', '한', '두', '세', '네', '다섯', '여섯', '일곱', '여덟', '아홉'];
+const TENS = ['', '열', '스물', '서른', '마흔', '쉰', '예순', '일흔', '여든', '아흔'];
+const koNumber = (n) => TENS[Math.floor(n / 10)] + ONES[n % 10];
+const koCount = (n, unit) => { const t = Math.floor(n / 10), o = n % 10; return ((t === 2 && o === 0) ? '스무' : TENS[t] + ONES_DET[o]) + ' ' + unit; };
+
+const MAX = 30;   // 녹음할 숫자 범위 (5분 안에 30마리 넘기는 어려움)
+const items = [];
+for (let n = 1; n <= MAX; n++) items.push({ key: `n/${n}`, label: `${n}`, phrase: `${koNumber(n)}!`, sub: `고래를 ${n}마리째 잡았을 때` });
+for (let n = 1; n <= MAX; n++) items.push({ key: `count/${n}`, label: `마리${n}`, phrase: `오늘은 고래를 ${koCount(n, '마리')} 먹었어요. 잘 자요.`, sub: '끝 화면 (선택 — 건너뛰어도 TTS로 대체돼요)' });
+items.push({ key: 'sleep', label: '잘자요', phrase: '바다가 잠들었어요. 잘 자요.', sub: '한 마리도 못 잡고 끝났을 때' });
+
+const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+const ext = mime.includes('mp4') ? 'm4a' : 'webm';
+const blobs = new Map();
+let cur = 0, stream = null, recorder = null, chunks = [];
+
+const $ = (id) => document.getElementById(id);
+function render() {
+  const it = items[cur];
+  $('step').textContent = `${cur + 1} / ${items.length}`;
+  $('phrase').textContent = it.phrase;
+  $('sub').textContent = it.sub;
+  $('play').disabled = !blobs.has(it.key);
+  $('prev').disabled = cur === 0; $('next').disabled = cur === items.length - 1;
+  $('count').textContent = blobs.size; $('zip').disabled = blobs.size === 0;
+  const list = $('list'); list.innerHTML = '';
+  items.forEach((x, i) => { const b = document.createElement('button'); b.textContent = x.label; b.className = (blobs.has(x.key) ? 'done ' : '') + (i === cur ? 'cur' : ''); b.onclick = () => { cur = i; render(); }; list.appendChild(b); });
+}
+async function toggleRec() {
+  if (recorder && recorder.state === 'recording') { recorder.stop(); return; }
+  if (!stream) { try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (e) { alert('마이크 권한이 필요해요: ' + e.message); return; } }
+  chunks = [];
+  recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  recorder.ondataavailable = (e) => chunks.push(e.data);
+  recorder.onstop = () => { blobs.set(items[cur].key, new Blob(chunks, { type: recorder.mimeType })); $('rec').textContent = '● 녹음'; $('rec').classList.remove('on'); render(); };
+  recorder.start();
+  $('rec').textContent = '■ 정지'; $('rec').classList.add('on');
+}
+$('rec').onclick = toggleRec;
+$('play').onclick = () => { const b = blobs.get(items[cur].key); if (b) new Audio(URL.createObjectURL(b)).play(); };
+$('prev').onclick = () => { cur = Math.max(0, cur - 1); render(); };
+$('next').onclick = () => { cur = Math.min(items.length - 1, cur + 1); render(); };
+$('zip').onclick = async () => {
+  const zip = new JSZip();
+  for (const [key, blob] of blobs) zip.file(`voice/${key}.${ext}`, blob);
+  const out = await zip.generateAsync({ type: 'blob' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(out); a.download = 'voice.zip'; a.click();
+};
+addEventListener('keydown', (e) => { if (e.code === 'Space') { e.preventDefault(); toggleRec(); } if (e.code === 'ArrowRight') $('next').click(); if (e.code === 'ArrowLeft') $('prev').click(); });
+render();
+</script>
+</body>
+</html>
